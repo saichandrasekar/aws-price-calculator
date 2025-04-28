@@ -1,0 +1,24 @@
+{
+  "region": "us-west-2",
+  "resources": [
+    {
+      "service": "ec2",
+      "instanceType": "t3.medium",
+      "operatingSystem": "Linux"
+    },
+    {
+      "service": "ec2",
+      "instanceType": "m5.large",
+      "operatingSystem": "Windows"
+    },
+    {
+      "service": "s3",
+      "storageSizeGB": 500
+    },
+    {
+      "service": "rds",
+      "instanceType": "db.t3.medium",
+      "engine": "MySQL"
+    }
+  ]
+}

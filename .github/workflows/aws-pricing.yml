@@ -1,0 +1,251 @@
+name: AWS Price Calculator
+
+on:
+  # Run on push to main branch
+  push:
+    branches: [ main ]
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: 'Path to AWS pricing config file'
+        required: false
+        default: '.github/aws-pricing-config.json'
+
+jobs:
+  calculate-aws-pricing:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 tabulate
+      
+      - name: Determine config file path
+        id: config_path
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            CONFIG_PATH="${{ github.event.inputs.config_path }}"
+          else
+            CONFIG_PATH=".github/aws-pricing-config.json"
+          fi
+          echo "Using config file: $CONFIG_PATH"
+          echo "path=$CONFIG_PATH" >> $GITHUB_OUTPUT
+      
+      - name: Validate config file exists
+        run: |
+          CONFIG_PATH="${{ steps.config_path.outputs.path }}"
+          if [ ! -f "$CONFIG_PATH" ]; then
+            echo "Error: Config file not found at $CONFIG_PATH"
+            exit 1
+          fi
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # We'll read the region from the config file later
+          aws-region: 'us-east-1'
+      
+      - name: Calculate AWS prices
+        id: calculate_prices
+        run: |
+          python -c "
+import boto3
+import json
+import sys
+import os
+from tabulate import tabulate
+
+def get_ec2_pricing(region, instance_type, os):
+    pricing_client = boto3.client('pricing', region_name='us-east-1')  # Note: Pricing API only available in us-east-1 and ap-south-1
+    
+    filters = [
+        {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': get_region_name(region)},
+        {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
+        {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': os},
+        {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'},
+        {'Type': 'TERM_MATCH', 'Field': 'capacitystatus', 'Value': 'Used'},
+        {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'}
+    ]
+    
+    response = pricing_client.get_products(
+        ServiceCode='AmazonEC2',
+        Filters=filters
+    )
+    
+    price_data = {}
+    for price_item in response['PriceList']:
+        price_item_dict = json.loads(price_item)
+        terms = price_item_dict.get('terms', {})
+        on_demand = terms.get('OnDemand', {})
+        
+        if on_demand:
+            # Get the first pricing dimension
+            dimension_key = list(list(on_demand.values())[0]['priceDimensions'].keys())[0]
+            price_per_unit = list(on_demand.values())[0]['priceDimensions'][dimension_key]['pricePerUnit']
+            price = price_per_unit.get('USD', 'N/A')
+            return float(price)
+    
+    return None
+
+def get_s3_pricing(region, storage_size_gb):
+    pricing_client = boto3.client('pricing', region_name='us-east-1')
+    
+    filters = [
+        {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': get_region_name(region)},
+        {'Type': 'TERM_MATCH', 'Field': 'storageClass', 'Value': 'General Purpose'},
+        {'Type': 'TERM_MATCH', 'Field': 'volumeType', 'Value': 'Standard'}
+    ]
+    
+    response = pricing_client.get_products(
+        ServiceCode='AmazonS3',
+        Filters=filters
+    )
+    
+    price_per_gb = None
+    for price_item in response['PriceList']:
+        price_item_dict = json.loads(price_item)
+        terms = price_item_dict.get('terms', {})
+        on_demand = terms.get('OnDemand', {})
+        
+        if on_demand:
+            for dimension_key in list(on_demand.values())[0]['priceDimensions']:
+                dimension = list(on_demand.values())[0]['priceDimensions'][dimension_key]
+                if 'per GB' in dimension.get('description', ''):
+                    price_per_gb = float(dimension['pricePerUnit'].get('USD', '0'))
+                    break
+    
+    if price_per_gb:
+        return price_per_gb * storage_size_gb
+    return None
+
+def get_rds_pricing(region, instance_type, engine):
+    pricing_client = boto3.client('pricing', region_name='us-east-1')
+    
+    filters = [
+        {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': get_region_name(region)},
+        {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
+        {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': engine}
+    ]
+    
+    response = pricing_client.get_products(
+        ServiceCode='AmazonRDS',
+        Filters=filters
+    )
+    
+    for price_item in response['PriceList']:
+        price_item_dict = json.loads(price_item)
+        terms = price_item_dict.get('terms', {})
+        on_demand = terms.get('OnDemand', {})
+        
+        if on_demand:
+            # Get the first pricing dimension
+            dimension_key = list(list(on_demand.values())[0]['priceDimensions'].keys())[0]
+            price_per_unit = list(on_demand.values())[0]['priceDimensions'][dimension_key]['pricePerUnit']
+            price = price_per_unit.get('USD', 'N/A')
+            return float(price)
+    
+    return None
+
+def get_region_name(region_code):
+    region_names = {
+        'us-east-1': 'US East (N. Virginia)',
+        'us-east-2': 'US East (Ohio)',
+        'us-west-1': 'US West (N. California)',
+        'us-west-2': 'US West (Oregon)',
+        'af-south-1': 'Africa (Cape Town)',
+        'ap-east-1': 'Asia Pacific (Hong Kong)',
+        'ap-south-1': 'Asia Pacific (Mumbai)',
+        'ap-northeast-3': 'Asia Pacific (Osaka)',
+        'ap-northeast-2': 'Asia Pacific (Seoul)',
+        'ap-southeast-1': 'Asia Pacific (Singapore)',
+        'ap-southeast-2': 'Asia Pacific (Sydney)',
+        'ap-northeast-1': 'Asia Pacific (Tokyo)',
+        'ca-central-1': 'Canada (Central)',
+        'eu-central-1': 'EU (Frankfurt)',
+        'eu-west-1': 'EU (Ireland)',
+        'eu-west-2': 'EU (London)',
+        'eu-west-3': 'EU (Paris)',
+        'eu-north-1': 'EU (Stockholm)',
+        'eu-south-1': 'EU (Milan)',
+        'me-south-1': 'Middle East (Bahrain)',
+        'sa-east-1': 'South America (São Paulo)'
+    }
+    return region_names.get(region_code, region_code)
+
+# Main logic
+config_path = '${{ steps.config_path.outputs.path }}'
+
+try:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    region = config.get('region', 'us-east-1')
+    resources = config.get('resources', [])
+    
+    # Configure AWS session for the specified region
+    session = boto3.Session(region_name=region)
+    
+    results = []
+    total_cost = 0
+    
+    print(f'## AWS Resource Pricing Summary')
+    print(f'Region: {region}')
+    print()
+    
+    for resource in resources:
+        service = resource.get('service', '').lower()
+        cost = None
+        description = service.upper()
+        
+        if service == 'ec2':
+            instance_type = resource.get('instanceType', 't3.micro')
+            os = resource.get('operatingSystem', 'Linux')
+            cost = get_ec2_pricing(region, instance_type, os)
+            description = f'EC2 {instance_type} ({os})'
+        elif service == 's3':
+            storage_size = resource.get('storageSizeGB', 1)
+            cost = get_s3_pricing(region, storage_size)
+            description = f'S3 Storage ({storage_size} GB)'
+        elif service == 'rds':
+            instance_type = resource.get('instanceType', 'db.t3.micro')
+            engine = resource.get('engine', 'MySQL')
+            cost = get_rds_pricing(region, instance_type, engine)
+            description = f'RDS {instance_type} ({engine})'
+        
+        if cost is not None:
+            results.append([description, f'${cost:.4f}'])
+            total_cost += cost
+        else:
+            results.append([description, 'Price not found'])
+    
+    results.append(['Total', f'${total_cost:.4f}'])
+    
+    print(tabulate(results, headers=['Resource', 'Monthly Cost (USD)'], tablefmt='github'))
+    
+    # Set output for GitHub Actions
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+        f.write(f'total_cost={total_cost:.4f}\\n')
+        f.write(f'region={region}\\n')
+    
+except Exception as e:
+    print(f'Error processing pricing information: {str(e)}')
+    sys.exit(1)
+          "
+      
+      - name: Summary
+        run: echo "Total estimated monthly cost for ${{ steps.calculate_prices.outputs.region }} - ${{ steps.calculate_prices.outputs.total_cost }} USD"
